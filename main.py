@@ -28,8 +28,7 @@ ALPACA_SYMBOL = os.getenv("ALPACA_SYMBOL", "RSP")
 # feed can be: "iex", "sip", or "otc"
 ALPACA_FEED = os.getenv("ALPACA_FEED", "iex")
 
-# Explicit start date to avoid "only 1 bar" issue
-# Alpaca defaults start to *today* if not provided, which only gives you today's bar. :contentReference[oaicite:1]{index=1}
+# Explicit start date to ensure history is available
 ALPACA_BARS_START_DATE = os.getenv("ALPACA_BARS_START_DATE", "1990-01-01")
 
 # Moving average window
@@ -104,11 +103,10 @@ def fetch_rsp_daily_bars(
     """
     Fetch 1Day bars for the given symbol from Alpaca's market data API.
 
-    Uses:
-      - timeframe=1Day
-      - adjustment=all
-      - feed=iex (by default)
-      - start=<ALPACA_BARS_START_DATE> to ensure we get historical bars
+    We want the MA to be based on the most recent daily close, so:
+      - We request bars sorted DESC (most recent first) from Alpaca.
+      - We ask for `limit = window` bars (e.g., 960).
+      - Then we re-sort them ASC locally so the list is chronological.
     """
     api_key = os.getenv(ALPACA_KEY_ENV)
     api_secret = os.getenv(ALPACA_SECRET_ENV)
@@ -127,12 +125,12 @@ def fetch_rsp_daily_bars(
         "limit": limit,
         "adjustment": "all",
         "feed": ALPACA_FEED,               # IEX instead of SIP
-        "start": ALPACA_BARS_START_DATE,   # avoid "today only" default
-        "sort": "asc",
+        "start": ALPACA_BARS_START_DATE,   # wide enough to cover history
+        "sort": "desc",                    # <-- MOST RECENT bars first
     }
 
     logger.info(
-        "Requesting %d daily bars for %s from Alpaca: %s with params %s",
+        "Requesting %d most recent daily bars for %s from Alpaca: %s with params %s",
         limit,
         symbol,
         url,
@@ -157,25 +155,26 @@ def fetch_rsp_daily_bars(
     bars = data.get("bars", [])
 
     logger.info(
-        "Received %d bars for %s from Alpaca (feed=%s, start=%s).",
+        "Received %d bars for %s from Alpaca (feed=%s, start=%s; requested latest=%d).",
         len(bars),
         symbol,
         ALPACA_FEED,
         ALPACA_BARS_START_DATE,
+        limit,
     )
 
     if not bars:
         logger.warning("No bars returned for %s. Check symbol, feed, or permissions.", symbol)
         return []
 
-    # Sort by timestamp just to be safe
+    # bars are most-recent-first from Alpaca; we want chronological.
     bars = sorted(bars, key=lambda b: b.get("t"))
 
     # Debug: show first and last bar plus last few closes
     first_bar = bars[0]
     last_bar = bars[-1]
     logger.debug(
-        "First bar: t=%s o=%.4f h=%.4f l=%.4f c=%.4f v=%s",
+        "First bar (oldest in window): t=%s o=%.4f h=%.4f l=%.4f c=%.4f v=%s",
         first_bar.get("t"),
         first_bar.get("o"),
         first_bar.get("h"),
@@ -184,7 +183,7 @@ def fetch_rsp_daily_bars(
         first_bar.get("v"),
     )
     logger.debug(
-        "Last bar: t=%s o=%.4f h=%.4f l=%.4f c=%.4f v=%s",
+        "Last bar (most recent in window): t=%s o=%.4f h=%.4f l=%.4f c=%.4f v=%s",
         last_bar.get("t"),
         last_bar.get("o"),
         last_bar.get("h"),
@@ -193,7 +192,7 @@ def fetch_rsp_daily_bars(
         last_bar.get("v"),
     )
 
-    logger.debug("Last 5 closes for %s:", symbol)
+    logger.debug("Last 5 closes for %s in MA window:", symbol)
     for b in bars[-5:]:
         logger.debug("  t=%s c=%.4f", b.get("t"), b.get("c"))
 
@@ -222,11 +221,12 @@ def compute_moving_average(bars: List[Dict[str, Any]], window: int) -> float:
         )
         window = len(closes)
 
+    # Take the last `window` closes — this is the 960-bar lookback ending at the most recent bar.
     relevant = closes[-window:]
     ma_value = sum(relevant) / window
 
     logger.info(
-        "Computed %d-day MA for %s closes: MA=%.4f",
+        "Computed %d-bar MA for %s closes (ending at most recent bar): MA=%.4f",
         window,
         ALPACA_SYMBOL,
         ma_value,
@@ -274,8 +274,8 @@ def classify_trend(last_price: float, ma_value: float) -> Tuple[str, float]:
 def run_once() -> None:
     """
     Single full cycle:
-    - Fetch bars from Alpaca (IEX feed) for RSP
-    - Compute 960-day MA (or fewer if limited)
+    - Fetch the LATEST 960 bars from Alpaca (IEX feed) for RSP
+    - Compute MA over those 960 closes (lookback from most recent bar)
     - Classify as WEAK/MODERATE/STRONG
     - Update Dashboard!T3
     """
@@ -285,7 +285,7 @@ def run_once() -> None:
     client = get_gspread_client()
     ws = get_dashboard_worksheet(client)
 
-    # 2) Fetch daily bars
+    # 2) Fetch daily bars (latest N)
     bars = fetch_rsp_daily_bars(ALPACA_SYMBOL, limit=MA_WINDOW)
 
     if not bars:
@@ -294,16 +294,15 @@ def run_once() -> None:
 
     # 3) Compute MA and current price
     ma_value = compute_moving_average(bars, MA_WINDOW)
-    last_bar = bars[-1]
+    last_bar = bars[-1]  # because we sorted ascending; this is the most recent bar
     last_price = float(last_bar["c"])
     last_time = last_bar.get("t")
 
     logger.info(
-        "Latest %s bar: t=%s close=%.4f (used for comparison with %d-day MA).",
+        "Latest %s bar: t=%s close=%.4f (used as the end of the 960-bar MA window).",
         ALPACA_SYMBOL,
         last_time,
         last_price,
-        MA_WINDOW,
     )
 
     # 4) Classify trend
@@ -341,13 +340,14 @@ def run_once() -> None:
 def main() -> None:
     logger.info(
         "RSP MA bot starting (Alpaca IEX feed). "
-        "Sheet='%s', tab='%s', cell='%s', interval=%ss, feed=%s, start=%s",
+        "Sheet='%s', tab='%s', cell='%s', interval=%ss, feed=%s, start=%s, window=%d",
         SHEET_NAME,
         DASHBOARD_TAB_NAME,
         TARGET_CELL,
         REFRESH_INTERVAL_SECONDS,
         ALPACA_FEED,
         ALPACA_BARS_START_DATE,
+        MA_WINDOW,
     )
 
     while True:
