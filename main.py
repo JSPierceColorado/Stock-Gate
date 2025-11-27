@@ -24,10 +24,18 @@ ALPACA_SECRET_ENV = "ALPACA_API_SECRET_KEY"
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_SYMBOL = os.getenv("ALPACA_SYMBOL", "RSP")
 
+# Use IEX instead of SIP
+# feed can be: "iex", "sip", or "otc"
+ALPACA_FEED = os.getenv("ALPACA_FEED", "iex")
+
+# Explicit start date to avoid "only 1 bar" issue
+# Alpaca defaults start to *today* if not provided, which only gives you today's bar. :contentReference[oaicite:1]{index=1}
+ALPACA_BARS_START_DATE = os.getenv("ALPACA_BARS_START_DATE", "1990-01-01")
+
 # Moving average window
 MA_WINDOW = int(os.getenv("MA_WINDOW", "960"))  # 960-day MA
 
-# Loop interval (seconds) – change if you want it less frequent
+# Loop interval (seconds)
 REFRESH_INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", "3600"))
 
 # Logging
@@ -74,9 +82,15 @@ def get_dashboard_worksheet(client: gspread.Client) -> gspread.Worksheet:
 def update_dashboard_cell(ws: gspread.Worksheet, value: str) -> None:
     """
     IMPORTANT: Only update the single target cell (T3 by default).
+    Uses update_acell to avoid gspread.update signature changes.
     """
-    logger.info("Updating %s!%s with value '%s'.", DASHBOARD_TAB_NAME, TARGET_CELL, value)
-    ws.update(TARGET_CELL, value)
+    logger.info(
+        "Updating %s!%s with value '%s'.",
+        DASHBOARD_TAB_NAME,
+        TARGET_CELL,
+        value,
+    )
+    ws.update_acell(TARGET_CELL, value)
 
 
 # ==========================
@@ -89,7 +103,12 @@ def fetch_rsp_daily_bars(
 ) -> List[Dict[str, Any]]:
     """
     Fetch 1Day bars for the given symbol from Alpaca's market data API.
-    Uses limit=limit and returns the raw list of bars.
+
+    Uses:
+      - timeframe=1Day
+      - adjustment=all
+      - feed=iex (by default)
+      - start=<ALPACA_BARS_START_DATE> to ensure we get historical bars
     """
     api_key = os.getenv(ALPACA_KEY_ENV)
     api_secret = os.getenv(ALPACA_SECRET_ENV)
@@ -100,15 +119,16 @@ def fetch_rsp_daily_bars(
             f"Ensure {ALPACA_KEY_ENV} and {ALPACA_SECRET_ENV} are set."
         )
 
-    url = f"{ALPACA_DATA_BASE_URL}/v2/stocks/{symbol}/bars"
+    base_url = ALPACA_DATA_BASE_URL.rstrip("/")
+    url = f"{base_url}/v2/stocks/{symbol}/bars"
+
     params = {
         "timeframe": "1Day",
         "limit": limit,
         "adjustment": "all",
-    }
-    headers = {
-        "APCA-API-KEY-ID": api_key,
-        "APCA-API-SECRET-KEY": api_secret,
+        "feed": ALPACA_FEED,               # IEX instead of SIP
+        "start": ALPACA_BARS_START_DATE,   # avoid "today only" default
+        "sort": "asc",
     }
 
     logger.info(
@@ -119,22 +139,33 @@ def fetch_rsp_daily_bars(
         params,
     )
 
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     logger.debug("Alpaca response status: %s", resp.status_code)
 
     try:
         resp.raise_for_status()
-    except Exception as e:
-        logger.error("Error response from Alpaca: %s", resp.text)
+    except Exception:
+        logger.error("Error response from Alpaca: %s", resp.text[:1000])
         raise
 
     data = resp.json()
     bars = data.get("bars", [])
 
-    logger.info("Received %d bars for %s.", len(bars), symbol)
+    logger.info(
+        "Received %d bars for %s from Alpaca (feed=%s, start=%s).",
+        len(bars),
+        symbol,
+        ALPACA_FEED,
+        ALPACA_BARS_START_DATE,
+    )
 
     if not bars:
-        logger.warning("No bars returned for %s. Check symbol or permissions.", symbol)
+        logger.warning("No bars returned for %s. Check symbol, feed, or permissions.", symbol)
         return []
 
     # Sort by timestamp just to be safe
@@ -179,6 +210,9 @@ def compute_moving_average(bars: List[Dict[str, Any]], window: int) -> float:
 
     closes = [float(b["c"]) for b in bars if "c" in b]
 
+    if not closes:
+        raise ValueError("No 'c' (close) values available in bars.")
+
     if len(closes) < window:
         logger.warning(
             "Only %d closes available; requested window is %d. "
@@ -197,6 +231,12 @@ def compute_moving_average(bars: List[Dict[str, Any]], window: int) -> float:
         ALPACA_SYMBOL,
         ma_value,
     )
+    logger.debug(
+        "MA window debug: first_close=%.4f last_close=%.4f sample_count=%d",
+        relevant[0],
+        relevant[-1],
+        len(relevant),
+    )
     return ma_value
 
 
@@ -205,7 +245,7 @@ def classify_trend(last_price: float, ma_value: float) -> Tuple[str, float]:
     Classification based on your rules:
 
     - WEAK:     price > 10% above MA
-    - MODERATE: price is above MA but less than or equal to 10% above MA
+    - MODERATE: price is above MA but <= 10% above MA
     - STRONG:   price below MA
 
     diff_pct is (price - MA) / MA * 100
@@ -234,12 +274,12 @@ def classify_trend(last_price: float, ma_value: float) -> Tuple[str, float]:
 def run_once() -> None:
     """
     Single full cycle:
-    - Fetch bars from Alpaca for RSP
-    - Compute 960-day MA
+    - Fetch bars from Alpaca (IEX feed) for RSP
+    - Compute 960-day MA (or fewer if limited)
     - Classify as WEAK/MODERATE/STRONG
     - Update Dashboard!T3
     """
-    logger.info("Starting RSP MA update cycle...")
+    logger.info("Starting RSP MA update cycle (Alpaca IEX feed)...")
 
     # 1) Google Sheets setup
     client = get_gspread_client()
@@ -259,19 +299,26 @@ def run_once() -> None:
     last_time = last_bar.get("t")
 
     logger.info(
-        "Latest RSP bar: t=%s close=%.4f (used for comparison with 960-day MA).",
+        "Latest %s bar: t=%s close=%.4f (used for comparison with %d-day MA).",
+        ALPACA_SYMBOL,
         last_time,
         last_price,
+        MA_WINDOW,
     )
 
     # 4) Classify trend
     label, diff_pct = classify_trend(last_price, ma_value)
 
     # 5) Update ONLY T3
-    # (Optionally read old value for debugging, still only touching T3)
     try:
         previous_value = ws.acell(TARGET_CELL).value
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "Could not read previous value from %s!%s: %s",
+            DASHBOARD_TAB_NAME,
+            TARGET_CELL,
+            e,
+        )
         previous_value = None
 
     logger.info(
@@ -293,11 +340,14 @@ def run_once() -> None:
 
 def main() -> None:
     logger.info(
-        "RSP MA bot starting. Sheet='%s', tab='%s', cell='%s', interval=%ss",
+        "RSP MA bot starting (Alpaca IEX feed). "
+        "Sheet='%s', tab='%s', cell='%s', interval=%ss, feed=%s, start=%s",
         SHEET_NAME,
         DASHBOARD_TAB_NAME,
         TARGET_CELL,
         REFRESH_INTERVAL_SECONDS,
+        ALPACA_FEED,
+        ALPACA_BARS_START_DATE,
     )
 
     while True:
@@ -306,7 +356,10 @@ def main() -> None:
         except Exception as e:
             logger.exception("Unexpected error during update cycle: %s", e)
 
-        logger.info("Sleeping for %d seconds before next run...", REFRESH_INTERVAL_SECONDS)
+        logger.info(
+            "Sleeping for %d seconds before next run...",
+            REFRESH_INTERVAL_SECONDS,
+        )
         time.sleep(REFRESH_INTERVAL_SECONDS)
 
 
